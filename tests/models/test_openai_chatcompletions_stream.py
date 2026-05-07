@@ -1,4 +1,6 @@
+import asyncio
 from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 from openai.types.chat.chat_completion_chunk import (
@@ -557,6 +559,122 @@ async def test_stream_response_yields_real_time_function_call_arguments(monkeypa
 
 @pytest.mark.allow_call_model_methods
 @pytest.mark.asyncio
+async def test_stream_response_yields_tool_call_arguments_before_stream_end(
+    monkeypatch,
+) -> None:
+    tool_call_start = ChoiceDeltaToolCall(
+        index=0,
+        id="tool-call-123",
+        function=ChoiceDeltaToolCallFunction(name="write_file", arguments=""),
+        type="function",
+    )
+    tool_call_args = ChoiceDeltaToolCall(
+        index=0,
+        function=ChoiceDeltaToolCallFunction(arguments='{"filename": "'),
+        type="function",
+    )
+    tool_call_done = ChoiceDeltaToolCall(
+        index=0,
+        function=ChoiceDeltaToolCallFunction(arguments='test.py"}'),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_start]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_args]))],
+    )
+    chunk3 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[tool_call_done]))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+    allow_finish = asyncio.Event()
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        yield chunk1
+        yield chunk2
+        await allow_finish.wait()
+        yield chunk3
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        response = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return response, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+    observed_events: asyncio.Queue[Any] = asyncio.Queue()
+    output_events = []
+
+    async def collect_events() -> None:
+        async for event in model.stream_response(
+            system_instructions=None,
+            input="",
+            model_settings=ModelSettings(),
+            tools=[],
+            output_schema=None,
+            handoffs=[],
+            tracing=ModelTracing.DISABLED,
+            previous_response_id=None,
+            conversation_id=None,
+            prompt=None,
+        ):
+            output_events.append(event)
+            await observed_events.put(event)
+
+    collect_task = asyncio.create_task(collect_events())
+    try:
+        assert (await asyncio.wait_for(observed_events.get(), timeout=1)).type == "response.created"
+        added_event = await asyncio.wait_for(observed_events.get(), timeout=1)
+        assert added_event.type == "response.output_item.added"
+        assert isinstance(added_event.item, ResponseFunctionToolCall)
+        assert added_event.item.name == "write_file"
+        delta_event = await asyncio.wait_for(observed_events.get(), timeout=1)
+        assert delta_event.type == "response.function_call_arguments.delta"
+        assert delta_event.delta == '{"filename": "'
+        assert not collect_task.done()
+
+        allow_finish.set()
+        await asyncio.wait_for(collect_task, timeout=1)
+    finally:
+        if not collect_task.done():
+            collect_task.cancel()
+            try:
+                await collect_task
+            except asyncio.CancelledError:
+                pass
+
+    remaining_events = output_events[3:]
+
+    assert [event.type for event in remaining_events] == [
+        "response.function_call_arguments.delta",
+        "response.output_item.done",
+        "response.completed",
+    ]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
 async def test_fallback_function_calls_have_unique_output_indexes(monkeypatch) -> None:
     tool_call_delta1 = ChoiceDeltaToolCall(
         index=0,
@@ -758,3 +876,401 @@ async def test_fallback_function_call_keeps_index_before_streamed_call(monkeypat
     assert added_by_name == {"fallback_first": 0, "streamed_second": 1}
     assert delta_indexes == [1, 0]
     assert done_by_name == {"streamed_second": 1, "fallback_first": 0}
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_text_before_mixed_tool_calls_offsets_tool_indexes(
+    monkeypatch,
+) -> None:
+    fallback_tool_call = ChoiceDeltaToolCall(
+        index=0,
+        function=ChoiceDeltaToolCallFunction(name="first_tool", arguments='{"a": 1}'),
+        type="function",
+    )
+    streamed_tool_call = ChoiceDeltaToolCall(
+        index=1,
+        id="second-tool-call-id",
+        function=ChoiceDeltaToolCallFunction(name="second_tool", arguments='{"b": 2}'),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="Preparing tools"))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[fallback_tool_call]))],
+    )
+    chunk3 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[streamed_tool_call]))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in (chunk1, chunk2, chunk3):
+            yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        response = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return response, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+    output_events = []
+
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    added_events = [event for event in output_events if event.type == "response.output_item.added"]
+    delta_events = [
+        event for event in output_events if event.type == "response.function_call_arguments.delta"
+    ]
+    done_events = [event for event in output_events if event.type == "response.output_item.done"]
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+
+    added_tool_indexes = {}
+    for event in added_events:
+        if isinstance(event.item, ResponseFunctionToolCall):
+            added_tool_indexes[event.item.name] = event.output_index
+
+    done_tool_indexes = {}
+    for event in done_events:
+        if isinstance(event.item, ResponseFunctionToolCall):
+            done_tool_indexes[event.item.name] = event.output_index
+
+    assert added_tool_indexes == {"first_tool": 1, "second_tool": 2}
+    assert {event.delta: event.output_index for event in delta_events} == {
+        '{"a": 1}': 1,
+        '{"b": 2}': 2,
+    }
+    assert done_tool_indexes == {"first_tool": 1, "second_tool": 2}
+    assert isinstance(completed_event.response.output[0], ResponseOutputMessage)
+    completed_tool_outputs = completed_event.response.output[1:]
+    completed_tool_names = []
+    for output in completed_tool_outputs:
+        assert isinstance(output, ResponseFunctionToolCall)
+        completed_tool_names.append(output.name)
+    assert completed_tool_names == ["first_tool", "second_tool"]
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_fallback_tool_call_before_text_uses_final_output_index(
+    monkeypatch,
+) -> None:
+    fallback_tool_call = ChoiceDeltaToolCall(
+        index=0,
+        function=ChoiceDeltaToolCallFunction(name="first_tool", arguments='{"a": 1}'),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[fallback_tool_call]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="answer"))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in (chunk1, chunk2):
+            yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        response = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return response, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+    output_events = []
+
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    added_events = [event for event in output_events if event.type == "response.output_item.added"]
+    delta_events = [
+        event for event in output_events if event.type == "response.function_call_arguments.delta"
+    ]
+    done_events = [event for event in output_events if event.type == "response.output_item.done"]
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+
+    added_message_event = next(
+        event for event in added_events if isinstance(event.item, ResponseOutputMessage)
+    )
+    added_tool_event = next(
+        event for event in added_events if isinstance(event.item, ResponseFunctionToolCall)
+    )
+    done_message_event = next(
+        event for event in done_events if isinstance(event.item, ResponseOutputMessage)
+    )
+    done_tool_event = next(
+        event for event in done_events if isinstance(event.item, ResponseFunctionToolCall)
+    )
+
+    assert added_message_event.output_index == 0
+    assert added_tool_event.output_index == 1
+    assert [event.output_index for event in delta_events] == [1]
+    assert done_message_event.output_index == 0
+    assert done_tool_event.output_index == 1
+
+    assert isinstance(completed_event.response.output[0], ResponseOutputMessage)
+    assert isinstance(completed_event.response.output[1], ResponseFunctionToolCall)
+    assert completed_event.response.output[1].name == "first_tool"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_streamed_tool_call_before_text_uses_final_output_index(
+    monkeypatch,
+) -> None:
+    streamed_tool_call = ChoiceDeltaToolCall(
+        index=0,
+        id="first-tool-call-id",
+        function=ChoiceDeltaToolCallFunction(name="first_tool", arguments='{"a": 1}'),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[streamed_tool_call]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="answer"))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in (chunk1, chunk2):
+            yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        response = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return response, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+    output_events = []
+
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    added_events = [event for event in output_events if event.type == "response.output_item.added"]
+    delta_events = [
+        event for event in output_events if event.type == "response.function_call_arguments.delta"
+    ]
+    done_events = [event for event in output_events if event.type == "response.output_item.done"]
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+
+    added_message_event = next(
+        event for event in added_events if isinstance(event.item, ResponseOutputMessage)
+    )
+    added_tool_event = next(
+        event for event in added_events if isinstance(event.item, ResponseFunctionToolCall)
+    )
+    done_message_event = next(
+        event for event in done_events if isinstance(event.item, ResponseOutputMessage)
+    )
+    done_tool_event = next(
+        event for event in done_events if isinstance(event.item, ResponseFunctionToolCall)
+    )
+
+    assert added_tool_event.output_index == 0
+    assert added_message_event.output_index == 1
+    assert [event.output_index for event in delta_events] == [0]
+    assert done_tool_event.output_index == 0
+    assert done_message_event.output_index == 1
+
+    assert isinstance(completed_event.response.output[0], ResponseFunctionToolCall)
+    assert isinstance(completed_event.response.output[1], ResponseOutputMessage)
+    assert completed_event.response.output[0].name == "first_tool"
+
+
+@pytest.mark.allow_call_model_methods
+@pytest.mark.asyncio
+async def test_stream_response_mixed_tool_calls_before_text_keep_streamed_order(
+    monkeypatch,
+) -> None:
+    fallback_tool_call = ChoiceDeltaToolCall(
+        index=0,
+        function=ChoiceDeltaToolCallFunction(name="first_tool", arguments='{"a": 1}'),
+        type="function",
+    )
+    streamed_tool_call = ChoiceDeltaToolCall(
+        index=1,
+        id="second-tool-call-id",
+        function=ChoiceDeltaToolCallFunction(name="second_tool", arguments='{"b": 2}'),
+        type="function",
+    )
+    chunk1 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[fallback_tool_call]))],
+    )
+    chunk2 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(tool_calls=[streamed_tool_call]))],
+    )
+    chunk3 = ChatCompletionChunk(
+        id="chunk-id",
+        created=1,
+        model="fake",
+        object="chat.completion.chunk",
+        choices=[Choice(index=0, delta=ChoiceDelta(content="answer"))],
+        usage=CompletionUsage(completion_tokens=1, prompt_tokens=1, total_tokens=2),
+    )
+
+    async def fake_stream() -> AsyncIterator[ChatCompletionChunk]:
+        for chunk in (chunk1, chunk2, chunk3):
+            yield chunk
+
+    async def patched_fetch_response(self, *args, **kwargs):
+        response = Response(
+            id="resp-id",
+            created_at=0,
+            model="fake-model",
+            object="response",
+            output=[],
+            tool_choice="none",
+            tools=[],
+            parallel_tool_calls=False,
+        )
+        return response, fake_stream()
+
+    monkeypatch.setattr(OpenAIChatCompletionsModel, "_fetch_response", patched_fetch_response)
+    model = OpenAIProvider(use_responses=False).get_model("gpt-4")
+    output_events = []
+
+    async for event in model.stream_response(
+        system_instructions=None,
+        input="",
+        model_settings=ModelSettings(),
+        tools=[],
+        output_schema=None,
+        handoffs=[],
+        tracing=ModelTracing.DISABLED,
+        previous_response_id=None,
+        conversation_id=None,
+        prompt=None,
+    ):
+        output_events.append(event)
+
+    added_events = [event for event in output_events if event.type == "response.output_item.added"]
+    delta_events = [
+        event for event in output_events if event.type == "response.function_call_arguments.delta"
+    ]
+    done_events = [event for event in output_events if event.type == "response.output_item.done"]
+    completed_event = next(event for event in output_events if event.type == "response.completed")
+
+    added_message_event = next(
+        event for event in added_events if isinstance(event.item, ResponseOutputMessage)
+    )
+    added_tool_indexes = {}
+    for event in added_events:
+        if isinstance(event.item, ResponseFunctionToolCall):
+            added_tool_indexes[event.item.name] = event.output_index
+    done_tool_indexes = {}
+    for event in done_events:
+        if isinstance(event.item, ResponseFunctionToolCall):
+            done_tool_indexes[event.item.name] = event.output_index
+
+    assert added_message_event.output_index == 2
+    assert added_tool_indexes == {"second_tool": 1, "first_tool": 0}
+    assert {event.delta: event.output_index for event in delta_events} == {
+        '{"b": 2}': 1,
+        '{"a": 1}': 0,
+    }
+    assert done_tool_indexes == {"second_tool": 1, "first_tool": 0}
+    assert isinstance(completed_event.response.output[0], ResponseFunctionToolCall)
+    assert isinstance(completed_event.response.output[1], ResponseFunctionToolCall)
+    assert isinstance(completed_event.response.output[2], ResponseOutputMessage)
+    assert completed_event.response.output[0].name == "first_tool"
+    assert completed_event.response.output[1].name == "second_tool"
